@@ -1,8 +1,12 @@
 //! Blinks the LED on a Pico board
 //!
 //! This will blink an LED attached to GP25, which is the pin the Pico uses for the on-board LED.
+
 #![no_std]
 #![no_main]
+
+mod inputs;
+mod rgb_led;
 
 use core::cell::RefCell;
 use core::ops::DerefMut;
@@ -13,34 +17,35 @@ use cortex_m::{
 use cortex_m_rt::entry;
 use defmt::*;
 use defmt_rtt as _;
-use embedded_hal::digital::v2::InputPin;
-// use embedded_hal::Pwm::Channel;
-use embedded_hal::PwmPin;
-// use embedded_time::duration::Extensions;
+use embedded_error;
+use embedded_hal::digital::v2::{InputPin, OutputPin};
 use embedded_time::fixed_point::FixedPoint;
 use panic_halt as _;
-use rp_pico as bsp;
+use rgb_led::RgbLed;
+use usb_device::{class_prelude::*, prelude::*};
+use usbd_serial::SerialPort;
 
-use bsp::hal::{
+use rp_pico::hal::{
     self,
     clocks::{init_clocks_and_plls, Clock},
     gpio::{
         self, bank0::Gpio25, bank0::Gpio8, bank0::Gpio9, Floating, Input, Output, Pin, PushPull,
     },
     pac::{self, interrupt},
-    pwm::{Channel, FreeRunning, Pwm6, Slice, Slices, B},
     sio::Sio,
     watchdog::Watchdog,
 };
 
 type LEDPinType = Pin<Gpio25, Output<PushPull>>;
-// static G_LED_PIN: Mutex<RefCell<Option<LEDPinType>>> = Mutex::new(RefCell::new(None));
+static G_LED_PIN: Mutex<RefCell<Option<LEDPinType>>> = Mutex::new(RefCell::new(None));
 
 type CountPinType = Pin<Gpio8, Input<Floating>>;
 type DirPinType = Pin<Gpio9, Input<Floating>>;
 static G_COUNTPIN: Mutex<RefCell<Option<CountPinType>>> = Mutex::new(RefCell::new(None));
 static G_DIRPIN: Mutex<RefCell<Option<DirPinType>>> = Mutex::new(RefCell::new(None));
 static G_COUNT: Mutex<RefCell<Option<i32>>> = Mutex::new(RefCell::new(None));
+// static G_TIMER:// static G_ALARM:
+static G_IS_LED_HIGH: Mutex<RefCell<Option<bool>>> = Mutex::new(RefCell::new(None));
 
 #[entry]
 fn main() -> ! {
@@ -64,57 +69,69 @@ fn main() -> ! {
     .unwrap();
     let mut delay = Delay::new(core.SYST, clocks.system_clock.freq().integer());
 
+    let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
+        pac.USBCTRL_REGS,
+        pac.USBCTRL_DPRAM,
+        clocks.usb_clock,
+        true,
+        &mut pac.RESETS,
+    ));
+
+    let mut serial = SerialPort::new(&usb_bus);
+    let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
+        .manufacturer("Road Running Inc")
+        .product("Serial port")
+        .serial_number("Beep-beep")
+        .device_class(2)
+        .build();
+
+    // info!("serial: {:?}", usb_dev);
+
     // let delay = Delay::new(core.SYST, clocks);
 
-    let mut timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS);
-    let alarm0 = timer.alarm_0().unwrap();
+    // let mut timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS);
+    // let alarm0 = timer.alarm_0().unwrap();
 
-    let pins = bsp::Pins::new(
+    /* */
+    //here
+    let pins = rp_pico::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
         sio.gpio_bank0,
         &mut pac.RESETS,
     );
 
-    let mut led_r = pins.gpio13;
-    let mut led_g = pins.gpio14;
-    let mut led_b = pins.gpio15;
+    let led_r = pins.gpio13;
+    let led_g = pins.gpio14;
+    let led_b = pins.gpio15;
 
-    // Setup PWMs
-    // There are 8 PWM slices, each with A and B channels
-    // r is on slice 6, channel A, g is on slice 7 channel A
-    // b is on slice 7 channel B
+    // // Setup PWMs
+    // // There are 8 PWM slices, each with A and B channels
+    // // r, gpio13, is on slice 6, channel A,
+    // // g, gpio14, is on slice 7, channel A
+    // // b, gpio15, is on slice 7, channel B
 
-    let mut pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
+    let pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
 
-    let mut rgb_leds = RgbLed::new(pwm_slices);
+    let mut rgb_leds = RgbLed::new(pwm_slices, led_r, led_g, led_b);
 
-    let pwm_r = &mut pwm_slices.pwm6;
-    pwm_r.set_ph_correct();
-    pwm_r.enable();
-    let channel_r = &mut pwm_r.channel_b;
-    channel_r.output_to(led_r);
-    channel_r.set_duty(0);
-
-    // let pwm_g = &mut pwm_slices.pwm7;
-    // pwm_g.set_ph_correct();
-    // pwm_g.enable();
-    // let channel_g = &mut pwm_g.channel_a;
-    // channel_g.output_to(led_g);
-    // channel_g.set_duty(0);
-
-    // // let pwm_b = &mut pwm_slices.pwm7;
-    // // pwm_b.set_ph_correct();
-    // // pwm_b.enable();
-    // let channel_b = &mut pwm_g.channel_b;
-    // channel_b.output_to(led_b);
-    // channel_b.set_duty(0);
-
-    let led_pin: LEDPinType = pins.led.into_push_pull_output();
+    /// Pins and definitions for rotary encoder
     let count_pin: CountPinType = pins.gpio8.into_floating_input();
     let count = 0;
     let dir_pin: DirPinType = pins.gpio9.into_floating_input();
-    count_pin.set_interrupt_enabled(gpio::Interrupt::EdgeHigh, true);
+
+    let xyz_input = inputs::Xyz::new(
+        pins.gpio10.into_pull_down_input(),
+        pins.gpio11.into_pull_down_input(),
+        pins.gpio12.into_pull_down_input(),
+    );
+
+    let mut speed_input = inputs::Stepsize::new(
+        pins.gpio18.into_pull_up_input(),
+        pins.gpio19.into_pull_up_input(),
+        pins.gpio20.into_pull_up_input(),
+        pins.gpio21.into_pull_up_input(),
+    );
 
     unsafe {
         pac::NVIC::unmask(pac::Interrupt::IO_IRQ_BANK0);
@@ -126,11 +143,16 @@ fn main() -> ! {
         G_COUNT.borrow(cs).replace(Some(count));
     });
     let mut old: i32 = 0;
-    let mut pwm_r: u16 = 0;
-    let mut pwm_g: u16 = 0;
-    let mut pwm_b: u16 = 0;
-    let mut g_active = false;
+
+    let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS);
+    let mut said_hello = false;
+
     loop {
+        if !said_hello && timer.get_counter() >= 2_000_000 {
+            said_hello = true;
+            let _ = serial.write(b"Hello, World!\r\n");
+        }
+
         free(|cs| {
             if let Some(count) = G_COUNT.borrow(cs).borrow_mut().deref_mut() {
                 if old != *count {
@@ -139,68 +161,40 @@ fn main() -> ! {
                 }
             };
         });
-        delay.delay_ms(50);
+        delay.delay_ms(20);
 
-        // let step_size = 1000;
+        rgb_leds.color_demo();
 
-        // if g_active {
-        //     channel_g.set_duty(65535 - pwm_g);
-        //     if pwm_g as u32 + step_size as u32 > 65535 {
-        //         pwm_g = 0;
-        //         g_active = false;
-        //     } else {
-        //         pwm_g += step_size;
-        //     };
-        // } else {
-        //     channel_b.set_duty(65535 - pwm_b);
-        //     if pwm_b as u32 + step_size as u32 > 65535 {
-        //         pwm_b = 0;
-        //         g_active = true;
-        //     } else {
-        //         pwm_b += step_size;
-        //     };
-        // }
+        if usb_dev.poll(&mut [&mut serial]) {
+            // info!("In usb_dev.poll");
+            let mut buf = [0u8; 64];
+            match serial.read(&mut buf) {
+                Err(_e) => {}
+                Ok(0) => {}
+                Ok(count) => {
+                    buf.iter_mut().take(count).for_each(|b| {
+                        b.make_ascii_uppercase();
+                    });
+                    let mut wrt_ptr = &buf[..count];
+                    while !wrt_ptr.is_empty() {
+                        match serial.write(wrt_ptr) {
+                            Ok(len) => wrt_ptr = &wrt_ptr[len..],
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }
 
-        // channel_b.set_duty(pwm_b);
-        // if (pwm_b as i32 - step_size as i32) < 1 {
-        //     pwm_b = 65000;
-        // } else {
-        //     pwm_b -= step_size;
-        // };
-        info!("pwm_r: {}, pwm_g: {}, pwm_b: {}", pwm_r, pwm_g, pwm_b);
-    }
-}
-
-struct RgbLed<'a> {
-    r: u16,
-    g: u16,
-    b: u16,
-    // pwm_slices: Slices,
-    pwm_r: &'a Slice<Pwm6, FreeRunning>,
-    // channel_r: &'a Channel<Pwm6, FreeRunning, B>,
-}
-
-// let pwm_r = &mut pwm_slices.pwm6;
-// pwm_r.set_ph_correct();
-// pwm_r.enable();
-// let channel_r = &mut pwm_r.channel_b;
-// channel_r.output_to(led_r);
-// channel_r.set_duty(0);
-
-impl RgbLed<'static> {
-    pub fn new(mut pwm_slices: Slices) -> RgbLed<'static> {
-        let pwm_r: &mut Slice<Pwm6, FreeRunning> = &mut pwm_slices.pwm6.into();
-        pwm_r.set_ph_correct();
-        pwm_r.enable();
-        let mut channel_r = &mut pwm_r.channel_b;
-
-        RgbLed {
-            // channel_r,
-            pwm_r,
-            r: 0,
-            g: 0,
-            b: 0,
-            // pwm_slices,
+        let a = speed_input.scan();
+        match a {
+            None => info!("speed: none"),
+            Some(a) => match (a) {
+                inputs::Speed::Slow => info!("speed: slow"),
+                inputs::Speed::Medium => info!("speed: medium"),
+                inputs::Speed::Fast => info!("speed: fast"),
+                inputs::Speed::Tramming => info!("speed: tramming"),
+            },
         }
     }
 }
@@ -232,162 +226,19 @@ fn IO_IRQ_BANK0() {
     });
 }
 
-// #[allow(non_snake_case)]
-// #[interrupt]
-// unsafe fn PIO0_IRQ_0() {
-//     static mut BUTTON: Option<CountPinType> = None;
-//     static mut COUNTER: Option<i32> = None;
-//     if COUNT_PIN.is_none() {
-//         free(|cs| {
-//             *COUNT_PIN = G_COUNT_PIN.borrow(&cs).take();
-//         });
-//     }
-//     if COUNTER.is_none() {
-//         cortex_m::interrupt::free(|cs| {
-//             *COUNTER = G_COUNTER.borrow(&cs).take();
-//         });
-//     }
+#[allow(non_snake_case)]
+#[interrupt]
+fn TIMER_IRQ_0() {
+    static mut LED: Option<LEDPinType> = None;
 
-//     info!("In IRQ");
-
-//     cortex_m::interrupt::free(|cs| {
-//         let ref mut g_count = G_COUNTER.borrow(cs).borrow_mut();
-//         if let Some(count) = g_count.as_mut() {
-//             *count += 1;
-//         }
-//     });
-// }
-
-// cortex_m::interrupt::free(|cs| {});
-
-/*
-    let mut encoder_count = pins.gpio8.into_floating_input();
-    let mut encoder_direction = pins.gpio9.into_floating_input();
-    unsafe {
-        pac::NVIC::unmask(pac::Interrupt::TIMER_IRQ_0);
+    if LED.is_none() {
+        cortex_m::interrupt::free(|cs| {
+            *LED = G_LED_PIN.borrow(&cs).take();
+        });
     }
-    encoder_count.set_interrupt_enabled(gpio::Interrupt::EdgeHigh, true);
-*/
+}
 
-// let mut led_r = pins.gpio13.into_push_pull_output();
-// let mut led_g = pins.gpio14.into_push_pull_output();
-// let mut led_b = pins.gpio15.into_push_pull_output();
-// let mut e_stop = pins.gpio28.into_floating_input();
-// let mut on_off = pins.gpio27.into_floating_input();
-// let mut x_pin = pins.gpio10.into_floating_input();
-// let mut y_pin = pins.gpio11.into_floating_input();
-// let mut z_pin = pins.gpio12.into_floating_input();
-// let mut speed_pins = (
-//     pins.gpio18.into_floating_input(),
-//     pins.gpio19.into_floating_input(),
-//     pins.gpio20.into_floating_input(),
-//     pins.gpio21.into_floating_input(),
-// );
-// let mut encoder_direction = pins.gpio9.into_floating_input();
-
-// unsafe {
-//     pac::NVIC::unmask(pac::Interrupt::TIMER_IRQ_0);
-//     pac::NVIC::unmask(pac::Interrupt::PIO0_IRQ_0);
-// }
-// encoder_count_pin.make_interrupt_source(pac::Interrupt::PIO0_IRQ_0);
-// encoder_count_pin.set_interrupt_enabled(gpio::Interrupt::EdgeHigh, true);
-
-// loop {
-//     let mut is_alarm_finished = false;
-//     cortex_m::interrupt::free(|cs| {
-//         let ref mut g_alarm0 = G_ALARM0.borrow(cs).borrow_mut();
-//         if let Some(alarm0) = g_alarm0.as_mut() {
-//             is_alarm_finished = alarm0.finished();
-//         }
-//     });
-
-//     if is_alarm_finished {
-//         cortex_m::interrupt::free(|cs| {
-//             let ref mut g_alarm0 = G_ALARM0.borrow(cs).borrow_mut();
-//             if let Some(alarm0) = g_alarm0.as_mut() {
-//                 let ref mut g_timer = G_TIMER.borrow(cs).borrow_mut();
-//                 if let Some(timer) = g_timer.as_mut() {
-//                     if G_IS_LED_HIGH.load(Ordering::Acquire) {
-//                         alarm0.schedule(500_000.microseconds()).unwrap();
-//                         info!("on!");
-//                     } else {
-//                         alarm0.schedule(1_500_000.microseconds()).unwrap();
-//                         info!("off!");
-//                     }
-//                     alarm0.enable_interrupt(timer);
-//                 }
-//             }
-//         });
-//     }
-
-// info!("on!");
-// led_pin.set_high().unwrap();
-// led_r.set_high().unwrap();
-// led_g.set_high().unwrap();
-// led_b.set_high().unwrap();
-// delay.delay_ms(500);
-// info!("off!");
-// led_pin.set_low().unwrap();
-// delay.delay_ms(500);
-//     }
-// }
-
-// #[allow(non_snake_case)]
-// #[interrupt]
-// fn TIMER_IRQ_0() {
-//     static mut LED: Option<LEDPinType> = None;
-//     if LED.is_none() {
-//         cortex_m::interrupt::free(|cs| {
-//             *LED = G_LED_PIN.borrow(&cs).take();
-//         });
-//     }
-
-//     if let Some(led) = LED {
-//         let is_high = G_IS_LED_HIGH.load(Ordering::Acquire);
-//         if is_high {
-//             led.set_low().unwrap();
-//         } else {
-//             led.set_high().unwrap();
-//         }
-//         G_IS_LED_HIGH.store(!is_high, Ordering::Release);
-//     }
-
-//     cortex_m::interrupt::free(|cs| {
-//         let ref mut g_alarm0 = G_ALARM0.borrow(cs).borrow_mut();
-//         if let Some(alarm0) = g_alarm0.as_mut() {
-//             let ref mut g_timer = G_TIMER.borrow(cs).borrow_mut();
-//             if let Some(timer) = g_timer.as_mut() {
-//                 alarm0.clear_interrupt(timer);
-//             }
-//         }
-//     });
-// }
-
-// // #[allow(non_snake_case)]
-// #[interrupt]
-// unsafe fn PIO0_IRQ_0() {
-//     static mut COUNT_PIN: Option<CountPinType> = None;
-//     static mut COUNTER: Option<i32> = None;
-//     if COUNT_PIN.is_none() {
-//         cortex_m::interrupt::free(|cs| {
-//             *COUNT_PIN = G_COUNT_PIN.borrow(&cs).take();
-//         });
-//     }
-//     if COUNTER.is_none() {
-//         cortex_m::interrupt::free(|cs| {
-//             *COUNTER = G_COUNTER.borrow(&cs).take();
-//         });
-//     }
-
-//     info!("In IRQ");
-
-//     cortex_m::interrupt::free(|cs| {
-//         let ref mut g_count = G_COUNTER.borrow(cs).borrow_mut();
-//         if let Some(count) = g_count.as_mut() {
-//             *count += 1;
-//         }
-//     });
-// }
+// // #[allow(n
 
 // unsafe fn USBCTRL_IRQ() {
 
