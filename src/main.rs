@@ -17,8 +17,8 @@ use cortex_m::{
 use cortex_m_rt::entry;
 use defmt::*;
 use defmt_rtt as _;
-use embedded_error;
-use embedded_hal::digital::v2::{InputPin, OutputPin};
+// use embedded_error;
+use embedded_hal::digital::v2::InputPin; //, OutputPin};
 use embedded_time::fixed_point::FixedPoint;
 use panic_halt as _;
 use rgb_led::RgbLed;
@@ -44,8 +44,6 @@ type DirPinType = Pin<Gpio9, Input<Floating>>;
 static G_COUNTPIN: Mutex<RefCell<Option<CountPinType>>> = Mutex::new(RefCell::new(None));
 static G_DIRPIN: Mutex<RefCell<Option<DirPinType>>> = Mutex::new(RefCell::new(None));
 static G_COUNT: Mutex<RefCell<Option<i32>>> = Mutex::new(RefCell::new(None));
-// static G_TIMER:// static G_ALARM:
-static G_IS_LED_HIGH: Mutex<RefCell<Option<bool>>> = Mutex::new(RefCell::new(None));
 
 #[entry]
 fn main() -> ! {
@@ -115,15 +113,15 @@ fn main() -> ! {
 
     let mut rgb_leds = RgbLed::new(pwm_slices, led_r, led_g, led_b);
 
-    /// Pins and definitions for rotary encoder
+    // Pins and definitions for rotary encoder
     let count_pin: CountPinType = pins.gpio8.into_floating_input();
     let count = 0;
     let dir_pin: DirPinType = pins.gpio9.into_floating_input();
 
-    let xyz_input = inputs::Xyz::new(
-        pins.gpio10.into_pull_down_input(),
-        pins.gpio11.into_pull_down_input(),
-        pins.gpio12.into_pull_down_input(),
+    let mut xyz_input = inputs::Xyz::new(
+        pins.gpio10.into_pull_up_input(),
+        pins.gpio11.into_pull_up_input(),
+        pins.gpio12.into_pull_up_input(),
     );
 
     let mut speed_input = inputs::Stepsize::new(
@@ -132,6 +130,9 @@ fn main() -> ! {
         pins.gpio20.into_pull_up_input(),
         pins.gpio21.into_pull_up_input(),
     );
+
+    let mut old_speed: Option<inputs::Speed> = None;
+    let mut old_axis: Option<inputs::Axis> = None;
 
     unsafe {
         pac::NVIC::unmask(pac::Interrupt::IO_IRQ_BANK0);
@@ -142,7 +143,7 @@ fn main() -> ! {
         G_COUNTPIN.borrow(cs).replace(Some(count_pin));
         G_COUNT.borrow(cs).replace(Some(count));
     });
-    let mut old: i32 = 0;
+    let mut old_count: i32 = 0;
 
     let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS);
     let mut said_hello = false;
@@ -150,14 +151,14 @@ fn main() -> ! {
     loop {
         if !said_hello && timer.get_counter() >= 2_000_000 {
             said_hello = true;
-            let _ = serial.write(b"Hello, World!\r\n");
+            let _ = serial.write(b"Pendant alive\r\n");
         }
 
         free(|cs| {
             if let Some(count) = G_COUNT.borrow(cs).borrow_mut().deref_mut() {
-                if old != *count {
-                    old = *count;
-                    info!("Count: {}", old);
+                if old_count != *count {
+                    old_count = *count;
+                    info!("Count: {}", old_count);
                 }
             };
         });
@@ -187,14 +188,14 @@ fn main() -> ! {
         }
 
         let a = speed_input.scan();
-        match a {
-            None => info!("speed: none"),
-            Some(a) => match (a) {
-                inputs::Speed::Slow => info!("speed: slow"),
-                inputs::Speed::Medium => info!("speed: medium"),
-                inputs::Speed::Fast => info!("speed: fast"),
-                inputs::Speed::Tramming => info!("speed: tramming"),
-            },
+        if a != old_speed {
+            info!("{}", inputs::Speed::report(a));
+            old_speed = a;
+        }
+        let b = xyz_input.scan();
+        if b != old_axis {
+            info!("{}", inputs::Axis::report(b));
+            old_axis = b;
         }
     }
 }
@@ -205,7 +206,7 @@ fn IO_IRQ_BANK0() {
     static mut DIRPIN: Option<DirPinType> = None;
     if DIRPIN.is_none() {
         free(|cs| {
-            *DIRPIN = G_DIRPIN.borrow(&cs).take();
+            *DIRPIN = G_DIRPIN.borrow(cs).take();
         });
     }
 
@@ -233,7 +234,7 @@ fn TIMER_IRQ_0() {
 
     if LED.is_none() {
         cortex_m::interrupt::free(|cs| {
-            *LED = G_LED_PIN.borrow(&cs).take();
+            *LED = G_LED_PIN.borrow(cs).take();
         });
     }
 }

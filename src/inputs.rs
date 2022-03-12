@@ -1,14 +1,10 @@
-use defmt::info;
-use embedded_error;
 use embedded_hal::digital::v2::InputPin;
 use rp_pico::hal::gpio::{
-    self,
     bank0::{Gpio10, Gpio11, Gpio12, Gpio18, Gpio19, Gpio20, Gpio21},
-    Floating, Input, Output, Pin, PullDown, PullUp, PushPull,
+    Input, Pin, PullUp,
 };
 /// Contains routines to collect the switch and pot reading neatly
 /// in one place
-use rp_pico::Pins;
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum Speed {
@@ -18,30 +14,117 @@ pub enum Speed {
     Tramming,
 }
 
-enum Axis {
+impl Speed {
+    pub fn report(a: Option<Speed>) -> &'static str {
+        match a {
+            None => "none",
+            Some(a) => match a {
+                Speed::Slow => "slow",
+                Speed::Medium => "medium",
+                Speed::Fast => "fast",
+                Speed::Tramming => "tramming",
+            },
+        }
+    }
+}
+
+#[derive(PartialEq, Clone, Copy)]
+pub enum Axis {
     X,
     Y,
     Z,
 }
 
-#[derive(Debug)]
-pub enum ScanningError {
-    SError(u8),
+impl Axis {
+    pub fn report(b: Option<Axis>) -> &'static str {
+        match b {
+            None => "None",
+            Some(a) => match a {
+                Axis::X => "x",
+                Axis::Y => "y",
+                Axis::Z => "z",
+            },
+        }
+    }
 }
 
 pub struct Xyz {
-    p_x: Pin<Gpio10, Input<PullDown>>,
-    p_y: Pin<Gpio11, Input<PullDown>>,
-    p_z: Pin<Gpio12, Input<PullDown>>,
+    p_x: Pin<Gpio10, Input<PullUp>>,
+    p_y: Pin<Gpio11, Input<PullUp>>,
+    p_z: Pin<Gpio12, Input<PullUp>>,
+    current: Option<Axis>,
+    next: Option<Axis>,
+    count: u8,
 }
 
 impl Xyz {
     pub fn new(
-        p_x: Pin<Gpio10, Input<PullDown>>,
-        p_y: Pin<Gpio11, Input<PullDown>>,
-        p_z: Pin<Gpio12, Input<PullDown>>,
+        p_x: Pin<Gpio10, Input<PullUp>>,
+        p_y: Pin<Gpio11, Input<PullUp>>,
+        p_z: Pin<Gpio12, Input<PullUp>>,
     ) -> Self {
-        Xyz { p_x, p_y, p_z }
+        Xyz {
+            p_x,
+            p_y,
+            p_z,
+            current: None,
+            next: None,
+            count: 0,
+        }
+    }
+
+    // Convert a number from 1-4 to a Speed type
+    pub fn index_to_axis(index: u8) -> Axis {
+        match index {
+            0 => Axis::X, // As wired!
+            1 => Axis::Y,
+            _ => Axis::Z,
+        }
+    }
+
+    /// Checks the three pins. Returns Ok(None) if no change or error,
+    /// and Ok(Axis) if there is a valid new axis and
+    pub fn scan(&mut self) -> Option<Axis> {
+        // Read the four inputs:
+        let pins = [
+            self.p_x.is_low().unwrap(),
+            self.p_y.is_low().unwrap(),
+            self.p_z.is_low().unwrap(),
+        ];
+
+        let mut axis: u8 = 0;
+        let mut count = 0;
+        // How many pins are high?
+        for (i, set) in pins.iter().enumerate() {
+            if *set {
+                axis = (i % 256) as u8; // zero based and holds last pin that is high
+                count += 1;
+            }
+        }
+
+        if count == 1 {
+            let now = Some(Xyz::index_to_axis(axis));
+            // Has the pin changed?
+            if self.current != now {
+                // If the pin has changed, store the new pin in self.next
+                // and start counting
+                if now == self.next {
+                    self.count += 1;
+
+                    if self.count == VALID_COUNT {
+                        self.current = self.next;
+                    }
+                } else {
+                    self.next = now;
+                    self.count = 0;
+                }
+            }
+        } else {
+            // If zero or more than 1 pins are high, output is None
+            self.count = 0;
+            self.current = None;
+        }
+        self.current
     }
 }
 
@@ -78,8 +161,8 @@ impl Stepsize {
     }
 
     // Convert a number from 1-4 to a Speed type
-    pub fn axis_to_speed(axis: u8) -> Speed {
-        match axis {
+    pub fn index_to_speed(index: u8) -> Speed {
+        match index {
             0 => Speed::Tramming, // As wired!
             1 => Speed::Fast,
             2 => Speed::Slow,
@@ -87,9 +170,8 @@ impl Stepsize {
         }
     }
 
-    /// Checks the three pins. Returns Ok(None) if no change,
-    /// Ok(Axis) if there is a valid new axis and
-    /// Error if zero or more than 1 pins is selected
+    /// Checks the three pins. Returns Ok(None) if no change or error,
+    /// and Ok(Axis) if there is a valid new axis and
     pub fn scan(&mut self) -> Option<Speed> {
         // Read the four inputs:
         let pins = [
@@ -98,8 +180,6 @@ impl Stepsize {
             self.s3.is_low().unwrap(),
             self.s4.is_low().unwrap(),
         ];
-
-        // info!("Pins: {:?}", pins);
 
         let mut axis: u8 = 0;
         let mut count = 0;
@@ -112,7 +192,7 @@ impl Stepsize {
         }
 
         if count == 1 {
-            let now = Some(Stepsize::axis_to_speed(axis));
+            let now = Some(Stepsize::index_to_speed(axis));
             // Has the pin changed?
             if self.current != now {
                 // If the pin has changed, store the new pin in self.next
