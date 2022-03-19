@@ -10,17 +10,18 @@ mod rgb_led;
 
 use core::cell::RefCell;
 use core::ops::DerefMut;
-use cortex_m::{
-    delay::Delay,
-    interrupt::{free, Mutex},
-};
+use cortex_m::delay::Delay;
+use cortex_m::interrupt::{free, Mutex};
 use cortex_m_rt::entry;
 use defmt::*;
 use defmt_rtt as _;
 // use embedded_error;
-use embedded_hal::digital::v2::InputPin; //, OutputPin};
-use embedded_time::fixed_point::FixedPoint;
+use embedded_hal::adc::OneShot;
+use embedded_hal::{digital::v2::InputPin, prelude::_embedded_hal_timer_CountDown}; //, OutputPin};
+use embedded_time::{duration::Extensions, fixed_point::FixedPoint};
+use nb;
 use panic_halt as _;
+
 use rgb_led::RgbLed;
 use usb_device::{class_prelude::*, prelude::*};
 use usbd_serial::SerialPort;
@@ -34,7 +35,17 @@ use rp_pico::hal::{
     pac::{self, interrupt},
     sio::Sio,
     watchdog::Watchdog,
+    Adc,
 };
+
+/// The USB Device Driver (shared with the interrupt).
+static mut USB_DEVICE: Option<UsbDevice<hal::usb::UsbBus>> = None;
+
+/// The USB Bus Driver (shared with the interrupt).
+static mut USB_BUS: Option<UsbBusAllocator<hal::usb::UsbBus>> = None;
+
+/// The USB Serial Device Driver (shared with the interrupt).
+static mut USB_SERIAL: Option<SerialPort<hal::usb::UsbBus>> = None;
 
 type LEDPinType = Pin<Gpio25, Output<PushPull>>;
 static G_LED_PIN: Mutex<RefCell<Option<LEDPinType>>> = Mutex::new(RefCell::new(None));
@@ -53,9 +64,8 @@ fn main() -> ! {
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let sio = Sio::new(pac.SIO);
 
-    let external_xtal_freq_hz = 12_000_000u32;
     let clocks = init_clocks_and_plls(
-        external_xtal_freq_hz,
+        rp_pico::XOSC_CRYSTAL_FREQ,
         pac.XOSC,
         pac.CLOCKS,
         pac.PLL_SYS,
@@ -65,7 +75,7 @@ fn main() -> ! {
     )
     .ok()
     .unwrap();
-    let mut delay = Delay::new(core.SYST, clocks.system_clock.freq().integer());
+    let _delay = Delay::new(core.SYST, clocks.system_clock.freq().integer());
 
     let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
         pac.USBCTRL_REGS,
@@ -74,24 +84,27 @@ fn main() -> ! {
         true,
         &mut pac.RESETS,
     ));
+    unsafe {
+        USB_BUS = Some(usb_bus);
+    }
+    let bus_ref = unsafe { USB_BUS.as_ref().unwrap() };
 
-    let mut serial = SerialPort::new(&usb_bus);
-    let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
+    let serial = SerialPort::new(&bus_ref);
+    unsafe {
+        USB_SERIAL = Some(serial);
+    }
+    // let serial = unsafe { USB_SERIAL.as_mut().unwrap() };
+
+    let usb_dev = UsbDeviceBuilder::new(&bus_ref, UsbVidPid(0x16c0, 0x27dd))
         .manufacturer("Road Running Inc")
         .product("Serial port")
         .serial_number("Beep-beep")
         .device_class(2)
         .build();
+    unsafe {
+        USB_DEVICE = Some(usb_dev);
+    }
 
-    // info!("serial: {:?}", usb_dev);
-
-    // let delay = Delay::new(core.SYST, clocks);
-
-    // let mut timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS);
-    // let alarm0 = timer.alarm_0().unwrap();
-
-    /* */
-    //here
     let pins = rp_pico::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
@@ -99,15 +112,18 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
+    let mut adc = Adc::new(pac.ADC, &mut pac.RESETS);
+    let mut adc_pin_0 = pins.gpio26.into_floating_input();
+
     let led_r = pins.gpio13;
     let led_g = pins.gpio14;
     let led_b = pins.gpio15;
 
-    // // Setup PWMs
-    // // There are 8 PWM slices, each with A and B channels
-    // // r, gpio13, is on slice 6, channel A,
-    // // g, gpio14, is on slice 7, channel A
-    // // b, gpio15, is on slice 7, channel B
+    // Setup PWMs
+    // There are 8 PWM slices, each with A and B channels
+    // r, gpio13, is on slice 6, channel A,
+    // g, gpio14, is on slice 7, channel A
+    // b, gpio15, is on slice 7, channel B
 
     let pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
 
@@ -131,11 +147,21 @@ fn main() -> ! {
         pins.gpio21.into_pull_up_input(),
     );
 
+    let e_stop_pin = pins.gpio28.into_pull_up_input();
+    let on_off_pin = pins.gpio27.into_pull_up_input();
+
+    // let e_stop = false;
+    // let mut on = false;
+    let mut old_e_stop = false;
+    let mut old_on = false;
+    let mut old_pot: u16 = 0;
+
     let mut old_speed: Option<inputs::Speed> = None;
     let mut old_axis: Option<inputs::Axis> = None;
 
     unsafe {
         pac::NVIC::unmask(pac::Interrupt::IO_IRQ_BANK0);
+        pac::NVIC::unmask(pac::Interrupt::USBCTRL_IRQ);
     }
 
     free(|cs| {
@@ -146,14 +172,16 @@ fn main() -> ! {
     let mut old_count: i32 = 0;
 
     let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS);
-    let mut said_hello = false;
+    let mut count_down = timer.count_down();
+
+    count_down.start(2000.milliseconds());
+    let _ = nb::block!(count_down.wait());
+    // let _ = serial.write(b"Pendant alive\r\n");
+
+    let mut _vcount: u32 = 0;
 
     loop {
-        if !said_hello && timer.get_counter() >= 2_000_000 {
-            said_hello = true;
-            let _ = serial.write(b"Pendant alive\r\n");
-        }
-
+        count_down.start(20.milliseconds());
         free(|cs| {
             if let Some(count) = G_COUNT.borrow(cs).borrow_mut().deref_mut() {
                 if old_count != *count {
@@ -162,29 +190,31 @@ fn main() -> ! {
                 }
             };
         });
-        delay.delay_ms(20);
+        // delay.delay_ms(20);
 
         rgb_leds.color_demo();
 
-        if usb_dev.poll(&mut [&mut serial]) {
-            // info!("In usb_dev.poll");
-            let mut buf = [0u8; 64];
-            match serial.read(&mut buf) {
-                Err(_e) => {}
-                Ok(0) => {}
-                Ok(count) => {
-                    buf.iter_mut().take(count).for_each(|b| {
-                        b.make_ascii_uppercase();
-                    });
-                    let mut wrt_ptr = &buf[..count];
-                    while !wrt_ptr.is_empty() {
-                        match serial.write(wrt_ptr) {
-                            Ok(len) => wrt_ptr = &wrt_ptr[len..],
-                            Err(_) => break,
-                        }
-                    }
-                }
-            }
+        let e_stop = e_stop_pin.is_high().unwrap();
+        if old_e_stop != e_stop {
+            info!("E stop: {}", e_stop);
+            old_e_stop = e_stop;
+        }
+
+        let on = on_off_pin.is_low().unwrap();
+        if old_on != on {
+            info!("On: {}", on);
+            old_on = on;
+        }
+
+        let pot: u16 = adc.read(&mut adc_pin_0).unwrap();
+        let diff = if old_pot >= pot {
+            old_pot - pot
+        } else {
+            pot - old_pot
+        };
+        if diff > 100 {
+            info!("Pot: {}", pot);
+            old_pot = pot;
         }
 
         let a = speed_input.scan();
@@ -197,6 +227,9 @@ fn main() -> ! {
             info!("{}", inputs::Axis::report(b));
             old_axis = b;
         }
+
+        let _ = nb::block!(count_down.wait());
+        let _ = count_down.wait();
     }
 }
 
@@ -239,52 +272,52 @@ fn TIMER_IRQ_0() {
     }
 }
 
-// // #[allow(n
+#[allow(non_snake_case)]
+#[interrupt]
+unsafe fn USBCTRL_IRQ() {
+    use core::sync::atomic::{AtomicBool, Ordering};
 
-// unsafe fn USBCTRL_IRQ() {
+    /// Note whether we've already printed the "hello" message.
+    static SAID_HELLO: AtomicBool = AtomicBool::new(false);
 
-//     use core::sync::atomic::{AtomicBool, Ordering};
+    // Grab the global objects. This is OK as we only access them under interrupt.
+    let usb_dev = USB_DEVICE.as_mut().unwrap();
 
-//     /// Note whether we've already printed the "hello" message.
-//     static SAID_HELLO: AtomicBool = AtomicBool::new(false);
+    let serial = USB_SERIAL.as_mut().unwrap();
 
-//     // Grab the global objects. This is OK as we only access them under interrupt.
-//     let usb_dev = USB_DEVICE.as_mut().unwrap();
-//     let serial = USB_SERIAL.as_mut().unwrap();
+    // Say hello exactly once on start-up
+    if !SAID_HELLO.load(Ordering::Relaxed) {
+        SAID_HELLO.store(true, Ordering::Relaxed);
+        let _ = serial.write(b"Hello, World!\r\n");
+    }
 
-//     // Say hello exactly once on start-up
-//     if !SAID_HELLO.load(Ordering::Relaxed) {
-//         SAID_HELLO.store(true, Ordering::Relaxed);
-//         let _ = serial.write(b"Hello, World!\r\n");
-//     }
+    // Poll the USB driver with all of our supported USB Classes
+    if usb_dev.poll(&mut [serial]) {
+        let mut buf = [0u8; 64];
+        match serial.read(&mut buf) {
+            Err(_e) => {
+                // Do nothing
+            }
+            Ok(0) => {
+                // Do nothing
+            }
+            Ok(count) => {
+                // Convert to upper case
+                buf.iter_mut().take(count).for_each(|b| {
+                    b.make_ascii_uppercase();
+                });
 
-//     // Poll the USB driver with all of our supported USB Classes
-//     if usb_dev.poll(&mut [serial]) {
-//         let mut buf = [0u8; 64];
-//         match serial.read(&mut buf) {
-//             Err(_e) => {
-//                 // Do nothing
-//             }
-//             Ok(0) => {
-//                 // Do nothing
-//             }
-//             Ok(count) => {
-//                 // Convert to upper case
-//                 buf.iter_mut().take(count).for_each(|b| {
-//                     b.make_ascii_uppercase();
-//                 });
-
-//                 // Send back to the host
-//                 let mut wr_ptr = &buf[..count];
-//                 while !wr_ptr.is_empty() {
-//                     let _ = serial.write(wr_ptr).map(|len| {
-//                         wr_ptr = &wr_ptr[len..];
-//                     });
-//                 }
-//             }
-//         }
-//     }
-// }
+                // Send back to the host
+                let mut wr_ptr = &buf[..count];
+                while !wr_ptr.is_empty() {
+                    let _ = serial.write(wr_ptr).map(|len| {
+                        wr_ptr = &wr_ptr[len..];
+                    });
+                }
+            }
+        }
+    }
+}
 
 // End of file
 
